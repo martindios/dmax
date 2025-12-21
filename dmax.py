@@ -1,13 +1,16 @@
-from scapy.all import srp, Ether, ARP, conf, IP, ICMP, sr1, UDP, sr, DNS, DNSQR
+from dataclasses import dataclass
+from scapy.all import *
 import argparse
 import ipaddress
 import signal
+import os
+import sys
 import requests
+import logging
 from typing import Optional, Union
 from ipaddress import ip_address
 from pprint import pprint
-from dataclasses import dataclass
-from ipaddress import IPv4Address, IPv6Address
+from ipaddress import IPv4Address, IPv6Address, _BaseNetwork
 
 IPAddress = Union[IPv4Address, IPv6Address]
 
@@ -34,22 +37,35 @@ def subnet_type(value: str) -> ipaddress._BaseNetwork:
                 )
 
 
+def check_root() -> None:
+    if os.name != "nt":
+        if os.geteuid() != 0:
+            logging.error("This script must be run as root.")
+            sys.exit(1)
+    else:
+        logging.warning("On Windows make sure to run as Administrator.")
+
+
 def signal_handler(sig, frame):
     print("Exiting gracefully")
     exit(0)
 
 
-def arp_broadcast(iface: str, subnet: str) -> dict[str, Host]:
-    """
-    Perform an ARP broadcast on a subnet to discover alive hosts.
-    """
-    hosts = {}
+def arp_broadcast(iface: str, subnet: _BaseNetwork) -> dict[IPAddress, Host]:
+    """Broadcast ARP on the requested subnet and return discovered hosts."""
+    hosts: Dict[IPAddress, Host] = {}
 
-    ans, _ = srp(
-            Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=str(subnet)),
-            timeout=2,
-            iface=iface
-            )
+    try:
+        ans, _unans = srp(
+                Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=str(subnet)),
+                timeout=2,
+                iface=iface,
+                verbose=0
+                )
+
+    except Exception as e:
+        logging.error("ARP scan failed: %s", e)
+        return hosts
 
     for _, rcv in ans:
         ip = ip_address(rcv.psrc)
@@ -111,6 +127,8 @@ def hosts_icmp(hosts: dict):
 
 def main():
     signal.signal(signal.SIGINT, signal_handler)
+
+    check_root()
 
     conf.verb = 0
 
