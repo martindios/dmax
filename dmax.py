@@ -1,17 +1,19 @@
 from dataclasses import dataclass
-from scapy.all import *
 import argparse
 import ipaddress
-import signal
 import os
 import sys
 import requests
 import logging
-from typing import Optional, Union
+from typing import Optional, Union, Dict
 from ipaddress import ip_address
 from pprint import pprint
 from ipaddress import IPv4Address, IPv6Address, _BaseNetwork
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from scapy.all import (
+    srp, Ether, ARP, sr1, IP, ICMP, conf, get_if_list
+)
 
 IPAddress = Union[IPv4Address, IPv6Address]
 
@@ -45,11 +47,6 @@ def check_root() -> None:
             sys.exit(1)
     else:
         logging.warning("On Windows make sure to run as Administrator.")
-
-
-def signal_handler(sig, frame):
-    print("Exiting gracefully")
-    exit(0)
 
 
 def arp_broadcast(iface: str, subnet: _BaseNetwork) -> dict[IPAddress, Host]:
@@ -110,7 +107,11 @@ def icmp_ping(ip: str, timeout: int = 2) -> Optional[int]:
 
 
 def ttl_to_os(ttl: int) -> str:
-    candidates = {64: "Linux / Unix / BSD", 128: "Windows", 255: "Cisco / Network device"}
+    candidates = {
+            64: "Linux / Unix / BSD",
+            128: "Windows",
+            255: "Cisco / Network device"
+            }
     best = min(candidates.keys(), key=lambda k: abs(k - ttl))
     return candidates[best]
 
@@ -145,41 +146,48 @@ def hosts_icmp(hosts: Dict[IPAddress, Host], timeout: int = 2, workers: int = 16
                 hosts[ip].reachable = False
 
 
+def parse_args():
+    p = argparse.ArgumentParser(description="dmax - network discovery")
+    p.add_argument("-i", "--interface", required=True, help="Network interface (e.g. eth0)")
+    p.add_argument("-s", "--subnet", type=subnet_type, required=True, help="Subnet to discover (e.g. 192.168.1.0/24)")
+    p.add_argument("-t", "--timeout", type=int, default=2, help="ICMP timeout seconds")
+    p.add_argument("-w", "--workers", type=int, default=16, help="Parallel ICMP workers")
+    p.add_argument("-v", "--verbose", action="count", default=0)
+    return p.parse_args()
+
+
 def main():
-    signal.signal(signal.SIGINT, signal_handler)
+
+    args = parse_args()
 
     lvl = logging.WARNING
+    if args.verbose == 1:
+        lvl = logging.INFO
+    elif args.verbose >= 2:
+        lvl = logging.DEBUG
+
     logging.basicConfig(level=lvl, format="%(levelname)s: %(message)s")
 
     check_root()
 
+    if args.interface not in get_if_list():
+        logging.error("Interface '%s' not found. Available: %s", args.interface, ", ".join(get_if_list()))
+        sys.exit(1)
+
     conf.verb = 0
-
-    parser = argparse.ArgumentParser(
-        description="""
-        dmax is a script for discovering hosts in a network.
-        """
-    )
-
-    parser.add_argument(
-            "-i", "--interface",
-            required=True,
-            help="Network interface name")
-
-    parser.add_argument(
-            "-s", "--subnet",
-            type=subnet_type,
-            required=True,
-            help="Subnet to discover")
-
-    args = parser.parse_args()
 
     hosts = arp_broadcast(args.interface, args.subnet)
 
-    hosts_icmp(hosts)
+    logging.info("Discovered %d hosts via ARP", len(hosts))
+
+    hosts_icmp(hosts, timeout=args.timeout, workers=args.workers)
 
     pprint(hosts)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logging.info("Exiting on user interrupt.")
+        sys.exit(0)
