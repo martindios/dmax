@@ -11,6 +11,7 @@ from typing import Optional, Union
 from ipaddress import ip_address
 from pprint import pprint
 from ipaddress import IPv4Address, IPv6Address, _BaseNetwork
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 IPAddress = Union[IPv4Address, IPv6Address]
 
@@ -70,14 +71,13 @@ def arp_broadcast(iface: str, subnet: _BaseNetwork) -> dict[IPAddress, Host]:
     for _, rcv in ans:
         ip = ip_address(rcv.psrc)
         mac = rcv.hwsrc
-        vendor = lookup_mac_vendor(mac)
+        vendor = None
+        try:
+            vendor = lookup_mac_vendor(mac)
+        except Exception:
+            vendor = None
 
-        hosts[ip] = Host(
-                ip=ip,
-                mac=mac,
-                vendor=vendor
-                )
-
+        hosts[ip] = Host(ip=ip, mac=mac, vendor=vendor)
     return hosts
 
 
@@ -95,38 +95,61 @@ def lookup_mac_vendor(mac: str) -> Optional[str]:
 
 
 def icmp_ping(ip: str, timeout: int = 2) -> Optional[int]:
-    pkt = IP(dst=ip) / ICMP()
-    reply = sr1(pkt, timeout=timeout, verbose=0)
+    """
+    Send one ICMP echo and return the TTL on reply (or None).
+    """
+    try:
+        pkt = IP(dst=ip) / ICMP()
+        reply = sr1(pkt, timeout=timeout, verbose=0)
+        if reply and IP in reply:
+            return int(reply[IP].ttl)
 
-    if reply and IP in reply:
-        return reply[IP].ttl
+    except Exception as e:
+        logging.debug("ICMP ping error for %s: %s", ip, e)
     return None
 
 
-def hosts_icmp(hosts: dict):
-    for ip, host in hosts.items():
-        ttl = icmp_ping(str(ip))
-        if ttl is not None:
-            host.reachable = True
-            host.ttl = ttl
+def ttl_to_os(ttl: int) -> str:
+    candidates = {64: "Linux / Unix / BSD", 128: "Windows", 255: "Cisco / Network device"}
+    best = min(candidates.keys(), key=lambda k: abs(k - ttl))
+    return candidates[best]
 
-            if ttl <= 64:
-                host.os_guess = "Linux / Unix"
-            elif ttl <= 128:
-                host.os_guess = "Windows"
-            elif ttl <= 255:
-                host.os_guess = "Cisco / BSD / Network Device"
-            else:
-                host.os_guess = "Unknown"
 
-        else:
-            host.reachable = False
-            host.ttl = None
-            host.os_guess = None
+def hosts_icmp(hosts: Dict[IPAddress, Host], timeout: int = 2, workers: int = 16) -> None:
+    """
+    Probe hosts concurrently with ICMP to set reachable/ttl/os_guess fields.
+    """
+    if not hosts:
+        return
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        future_map = {
+                ex.submit(icmp_ping, str(ip), timeout):
+                    ip for ip in hosts.keys()
+                }
+        for fut in as_completed(future_map):
+            ip = future_map[fut]
+            try:
+                ttl = fut.result()
+                host = hosts[ip]
+                if ttl is not None:
+                    host.reachable = True
+                    host.ttl = ttl
+                    host.os_guess = ttl_to_os(ttl)
+                else:
+                    host.reachable = False
+                    host.ttl = None
+                    host.os_guess = None
+            except Exception as e:
+                logging.debug("Error probing %s: %s", ip, e)
+                hosts[ip].reachable = False
 
 
 def main():
     signal.signal(signal.SIGINT, signal_handler)
+
+    lvl = logging.WARNING
+    logging.basicConfig(level=lvl, format="%(levelname)s: %(message)s")
 
     check_root()
 
