@@ -83,12 +83,17 @@ def lookup_mac_vendor(mac: str) -> Optional[str]:
     Look up the vendor name for a given MAC address.
     """
     url = f"https://api.macvendors.com/{mac}"
-    response = requests.get(url, timeout=5)
+    try:
 
-    if response.status_code == 200:
-        return response.text
-    else:
-        return None
+        response = requests.get(url, timeout=5)
+
+        if response.status_code == 200:
+            return response.text
+
+    except requests.RequestException:
+        logging.debug("Vendor lookup failed for %s", mac)
+
+    return None
 
 
 def icmp_ping(ip: str, timeout: int = 2) -> Optional[int]:
