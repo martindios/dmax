@@ -34,7 +34,7 @@ def subnet_type(value: str) -> ipaddress._BaseNetwork:
     """
     try:
         return ipaddress.ip_network(value, strict=False)
-    except ValueError:
+    except ValueError("Not a valid IPv4/IPv6 network"):
         raise argparse.ArgumentTypeError(
                 f"Invalid subnet: {value}."
                 )
@@ -42,21 +42,24 @@ def subnet_type(value: str) -> ipaddress._BaseNetwork:
 
 def check_root() -> None:
     if os.name != "nt":
-        if os.geteuid() != 0:
-            logging.error("This script must be run as root.")
-            sys.exit(1)
+        try:
+            if os.geteuid() != 0:
+                logging.error("This script must be run as root.")
+                sys.exit(1)
+        except AttributeError:
+            pass  # non-POSIX platform doesn't have geteuid()
     else:
         logging.warning("On Windows make sure to run as Administrator.")
 
 
-def arp_broadcast(iface: str, subnet: _BaseNetwork) -> dict[IPAddress, Host]:
+def arp_broadcast(iface: str, subnet: _BaseNetwork, timeout: int = 2) -> Dict[IPAddress, Host]:
     """Broadcast ARP on the requested subnet and return discovered hosts."""
     hosts: Dict[IPAddress, Host] = {}
 
     try:
         ans, _unans = srp(
                 Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=str(subnet)),
-                timeout=2,
+                timeout=timeout,
                 iface=iface,
                 verbose=0
                 )
@@ -82,9 +85,11 @@ def lookup_mac_vendor(mac: str) -> Optional[str]:
     """
     Look up the vendor name for a given MAC address.
     """
-    url = f"https://api.macvendors.com/{mac}"
-    try:
+    # To anonymize the MAC address by removing the device-specific part
+    anonymized_mac = mac.rsplit(":", 3)[0] + ":ff:ff:ff"
+    url = f"https://api.macvendors.com/{anonymized_mac}"
 
+    try:
         response = requests.get(url, timeout=5)
 
         if response.status_code == 200:
