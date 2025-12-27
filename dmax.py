@@ -8,9 +8,11 @@ import logging
 import time
 from typing import Optional, Union, Dict, Iterable
 from ipaddress import ip_address, IPv4Address, IPv6Address, _BaseNetwork
-from pprint import pprint
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
+import json
+import csv
+import io
 
 from scapy.all import (
     srp, Ether, ARP, sr1, IP, ICMP, conf, get_if_list
@@ -158,7 +160,9 @@ def hosts_icmp(hosts: Dict[IPAddress, Host], timeout: int = 2, workers: int = 16
             if show_progress and logging.getLogger().isEnabledFor(logging.INFO):
                 logging.info("ICMP probes: %d/%d completed", completed, total)
 
+
 # Output helpers
+
 
 def sort_hosts(hosts: Dict[IPAddress, Host]) -> list[Host]:
     return [hosts[k] for k in sorted(hosts.keys())]
@@ -187,6 +191,55 @@ def format_table(hosts: Iterable[Host]) -> str:
     return "\n".join(lines)
 
 
+def output_json(hosts: Iterable[Host], out_file: Optional[str] = None) -> None:
+    data = [
+        {
+            "ip": str(h.ip),
+            "mac": h.mac,
+            "vendor": h.vendor,
+            "reachable": h.ttl,
+            "os_guess": h.os_guess,
+        }
+        for h in hosts
+    ]
+    s = json.dumps(data, indent=2)
+    if out_file:
+        with open(out_file, "w", encoding="utf-8") as f:
+            f.write(s)
+        logging.info("Wrote JSON output to %s", out_file)
+    else:
+        print(s)
+
+
+def output_csv(hosts: Iterable[Host], out_file: Optional[str] = None) -> None:
+    fieldnames = ["ip", "mac", "vendor", "reachable", "ttl", "os_guess"]
+    
+    rows = [
+        {
+            "ip": str(h.ip),
+            "mac": h.mac,
+            "vendor": h.vendor or "",
+            "reachable": "yes" if h.reachable else "no",
+            "ttl": str(h.ttl) if h.ttl is not None else "",
+            "os_guess": h.os_guess or "",
+        }
+        for h in hosts
+    ]
+
+    if out_file:
+        with open(out_file, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        logging.info("Wrote CSV output to %s", out_file)
+    else:
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+        print(output.getvalue(), end="")
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="dmax - network discovery")
     p.add_argument("-i", "--interface", required=True, help="Network interface (e.g. eth0)")
@@ -196,6 +249,7 @@ def parse_args():
     p.add_argument("-v", "--verbose", action="count", default=0)
     p.add_argument("--no-vendor", action="store_true", help="Skip MAC vendor lookups (faster, offline)")
     p.add_argument("--output", choices=["table", "json", "csv"], default="table", help="Output format")
+    p.add_argument("--out-file", help="Write output to file instead of stdout")
     return p.parse_args()
 
 
@@ -244,10 +298,15 @@ def main():
 
     if args.output == "table":
         print(format_table(sorted_list))
+    elif args.output == "json":
+        output_json(sorted_list, out_file=args.out_file)
+    elif args.output == "csv":
+        output_csv(sorted_list, out_file=args.out_file)
 
     elapsed = time.perf_counter() - start
     reachable = sum(1 for h in hosts.values() if h.reachable)
     logging.info("Summary: %d/%d reachable. Elapsed: %.2fs", reachable, len(hosts), elapsed)
+
 
 if __name__ == "__main__":
     try:
