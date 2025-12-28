@@ -6,7 +6,8 @@ import sys
 import requests
 import logging
 import time
-from typing import Optional, Union, Dict, Iterable
+import socket
+from typing import Optional, Union, Dict, Iterable, List
 from ipaddress import ip_address, IPv4Address, IPv6Address, _BaseNetwork
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
@@ -15,7 +16,7 @@ import csv
 import io
 
 from scapy.all import (
-    srp, Ether, ARP, sr1, IP, ICMP, conf, get_if_list
+    srp, Ether, ARP, sr1, srp1, IP, ICMP, conf, get_if_list
 )
 
 IPAddress = Union[IPv4Address, IPv6Address]
@@ -26,6 +27,7 @@ class Host:
     ip: IPAddress
     mac: str
     vendor: Optional[str] = None
+    hostname: Optional[str] = None
     reachable: bool = False
     ttl: Optional[int] = None
     os_guess: Optional[str] = None
@@ -37,10 +39,8 @@ def subnet_type(value: str) -> ipaddress._BaseNetwork:
     """
     try:
         return ipaddress.ip_network(value, strict=False)
-    except ValueError("Not a valid IPv4/IPv6 network"):
-        raise argparse.ArgumentTypeError(
-                f"Invalid subnet: {value}."
-                )
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid subnet: {value}.")
 
 
 def check_root() -> None:
@@ -89,6 +89,8 @@ def lookup_mac_vendor(mac: str) -> Optional[str]:
     """
     url = f"https://api.macvendors.com/{mac}"
 
+    time.sleep(0.25)  # rate limit
+
     try:
         response = requests.get(url, timeout=5)
 
@@ -103,18 +105,28 @@ def lookup_mac_vendor(mac: str) -> Optional[str]:
     return None
 
 
-def icmp_ping(ip: str, timeout: int = 2) -> Optional[int]:
+def icmp_ping(ip: str, mac: Optional[str], timeout: int = 2, retries: int = 1) -> Optional[int]:
     """
     Send one ICMP echo and return the TTL on reply (or None).
     """
-    try:
-        pkt = IP(dst=ip) / ICMP()
-        reply = sr1(pkt, timeout=timeout, verbose=0)
-        if reply and IP in reply:
-            return int(reply[IP].ttl)
+    for attempt in range(retries + 1):
+        try:
+            if mac:
+                pkt = Ether(dst=mac) / IP(dst=ip) / ICMP()
+                reply = srp1(pkt, timeout=timeout, verbose=0)
+            else:
+                pkt = IP(dst=ip) / ICMP()
+                reply = sr1(pkt, timeout=timeout, verbose=0)
 
-    except Exception as e:
-        logging.debug("ICMP ping error for %s: %s", ip, e)
+            if reply and IP in reply:
+                return int(reply[IP].ttl)
+
+        except Exception as e:
+            if attempt == retries:
+                logging.debug("ICMP ping error for %s: %s", ip, e)
+        if attempt < retries:
+            time.sleep(0.1)
+
     return None
 
 
@@ -128,7 +140,7 @@ def ttl_to_os(ttl: int) -> str:
     return candidates[best]
 
 
-def hosts_icmp(hosts: Dict[IPAddress, Host], timeout: int = 2, workers: int = 16, show_progress: bool = True) -> None:
+def hosts_icmp(hosts: Dict[IPAddress, Host], timeout: int = 2, workers: int = 16, retry: int = 1, show_progress: bool = True) -> None:
     """
     Probe hosts concurrently with ICMP to set reachable/ttl/os_guess fields.
     """
@@ -139,7 +151,7 @@ def hosts_icmp(hosts: Dict[IPAddress, Host], timeout: int = 2, workers: int = 16
     completed = 0
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        future_map = {ex.submit(icmp_ping, str(ip), timeout): ip for ip in hosts.keys()}
+        future_map = {ex.submit(icmp_ping, str(ip), hosts[ip].mac, timeout, retry): ip for ip in hosts.keys()}
         for fut in as_completed(future_map):
             ip = future_map[fut]
             try:
@@ -161,10 +173,52 @@ def hosts_icmp(hosts: Dict[IPAddress, Host], timeout: int = 2, workers: int = 16
                 logging.info("ICMP probes: %d/%d completed", completed, total)
 
 
+def resolve_hostname(ip: str, timeout: int = 2) -> Optional[str]:
+    """
+    Resolve hostname for given IP address using reverse DNS lookup.
+    """
+    try:
+        socket.setdefaulttimeout(timeout)
+        hostname, _, _ = socket.gethostbyaddr(ip)
+        return hostname
+    except (socket.herror, socket.gaierror, socket.timeout):
+        logging.debug("Hostname resolution failed for %s", ip)
+    except Exception as e:
+        logging.debug("Hostname resolution error for %s: %s", ip, e)
+    finally:
+        socket.setdefaulttimeout(None)
+
+    return None
+
+
+def hosts_resolve_hostnames(hosts: Dict[IPAddress, Host], timeout: int = 2, workers: int = 16, show_progress: bool = True) -> None:
+    """
+    Resolve hostnames for discovered hosts concurrently.
+    """
+    if not hosts:
+        return
+
+    total = len(hosts)
+    completed = 0
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        future_map = {ex.submit(resolve_hostname, str(ip), timeout): ip for ip in hosts.keys()}
+        for fut in as_completed(future_map):
+            ip = future_map[fut]
+            try:
+                hostname = fut.result()
+                hosts[ip].hostname = hostname
+            except Exception as e:
+                logging.debug("Error resolving hostname for %s: %s", ip, e)
+            completed += 1
+            if show_progress and logging.getLogger().isEnabledFor(logging.INFO):
+                logging.info("Hostname resolution: %d/%d completed", completed, total)
+
+
 # Output helpers
 
 
-def sort_hosts(hosts: Dict[IPAddress, Host]) -> list[Host]:
+def sort_hosts(hosts: Dict[IPAddress, Host]) -> List[Host]:
     return [hosts[k] for k in sorted(hosts.keys())]
 
 
@@ -172,13 +226,14 @@ def format_table(hosts: Iterable[Host]) -> str:
     rows = [[
         str(h.ip),
         h.mac,
+        h.hostname or "-",
         h.vendor or "-",
         "yes" if h.reachable else "no",
         str(h.ttl) if h.ttl is not None else "-",
         h.os_guess or "-",
         ] for h in hosts]
 
-    headers = ["IP", "MAC", "Vendor", "Reachable", "TTL", "OS Guess"]
+    headers = ["IP", "MAC", "Hostname", "Vendor", "Reachable", "TTL", "OS Guess"]
 
     cols = list(zip(*([headers] + rows))) if rows else [tuple(headers)]
     widths = [max(len(str(cell)) for cell in col) for col in cols]
@@ -191,13 +246,25 @@ def format_table(hosts: Iterable[Host]) -> str:
     return "\n".join(lines)
 
 
+def output_table(hosts: Iterable[Host], out_file: Optional[str] = None) -> None:
+    s = format_table(hosts)
+    if out_file:
+        with open(out_file, "w", encoding="utf-8") as f:
+            f.write(s)
+        logging.info("Wrote table output to %s", out_file)
+    else:
+        print(s)
+
+
 def output_json(hosts: Iterable[Host], out_file: Optional[str] = None) -> None:
     data = [
         {
             "ip": str(h.ip),
             "mac": h.mac,
+            "hostname": h.hostname,
             "vendor": h.vendor,
-            "reachable": h.ttl,
+            "reachable": h.reachable,
+            "ttl": h.ttl,
             "os_guess": h.os_guess,
         }
         for h in hosts
@@ -212,12 +279,13 @@ def output_json(hosts: Iterable[Host], out_file: Optional[str] = None) -> None:
 
 
 def output_csv(hosts: Iterable[Host], out_file: Optional[str] = None) -> None:
-    fieldnames = ["ip", "mac", "vendor", "reachable", "ttl", "os_guess"]
+    fieldnames = ["ip", "mac", "hostname", "vendor", "reachable", "ttl", "os_guess"]
     
     rows = [
         {
             "ip": str(h.ip),
             "mac": h.mac,
+            "hostname": h.hostname or "",
             "vendor": h.vendor or "",
             "reachable": "yes" if h.reachable else "no",
             "ttl": str(h.ttl) if h.ttl is not None else "",
@@ -242,15 +310,49 @@ def output_csv(hosts: Iterable[Host], out_file: Optional[str] = None) -> None:
 
 def parse_args():
     p = argparse.ArgumentParser(description="dmax - network discovery")
-    p.add_argument("-i", "--interface", required=True, help="Network interface (e.g. eth0)")
-    p.add_argument("-s", "--subnet", type=subnet_type, required=True, help="Subnet to discover (e.g. 192.168.1.0/24)")
-    p.add_argument("-t", "--timeout", type=int, default=2, help="ICMP timeout seconds")
-    p.add_argument("-w", "--workers", type=int, default=16, help="Parallel ICMP workers")
-    p.add_argument("-v", "--verbose", action="count", default=0)
-    p.add_argument("--no-vendor", action="store_true", help="Skip MAC vendor lookups (faster, offline)")
-    p.add_argument("--output", choices=["table", "json", "csv"], default="table", help="Output format")
-    p.add_argument("--out-file", help="Write output to file instead of stdout")
-    return p.parse_args()
+
+    # Required flags
+    p.add_argument("-i", "--interface", required=True,
+                   help="Network interface (e.g. eth0)")
+    p.add_argument("-s", "--subnet", type=subnet_type, required=True,
+                   help="Subnet to discover (e.g. 192.168.1.0/24)")
+
+    # Feature flags
+    features = p.add_argument_group('feature toggles')
+    features.add_argument("--no-icmp", action="store_true",
+                          help="Skip ICMP probing (faster ARP-only scan)")
+    features.add_argument("--no-resolve-hostnames", action="store_true",
+                          help="Skip reverse DNS lookups for hostnames")
+    features.add_argument("--no-vendor", action="store_true",
+                          help="Skip MAC vendor lookups (faster, offline)")
+
+    # Timing and concurrency (applies to ICMP and hostname resolution)
+    timing = p.add_argument_group('timing and concurrency options')
+    timing.add_argument("-t", "--timeout", type=int, default=2,
+                        help="Timeout in seconds for network operations (ICMP, DNS)")
+    timing.add_argument("-w", "--workers", type=int, default=16,
+                        help="Number of parallel workers for probing operations")
+
+    # ICMP-specific options
+    icmp_opts = p.add_argument_group('ICMP-specific options (ignored if --no-icmp is set)')
+    icmp_opts.add_argument("-r", "--retry", type=int, default=1,
+                          help="Number of ICMP retry attempts")
+
+    # Output options
+    output_opts = p.add_argument_group('output options')
+    output_opts.add_argument("--output", choices=["table", "json", "csv"], default="table",
+                             help="Output format")
+    output_opts.add_argument("--out-file",
+                             help="Write output to file instead of stdout")
+    output_opts.add_argument("-v", "--verbose", action="count", default=0,
+                             help="Increase verbosity (-v for INFO, -vv for DEBUG)")
+
+    args = p.parse_args()
+
+    if args.no_icmp and args.retry != 1:
+        p.error("--retry option is only applicable when ICMP probing is enabled (don't use with --no-icmp)")
+
+    return args
 
 
 def main():
@@ -268,7 +370,8 @@ def main():
     check_root()
 
     if args.interface not in get_if_list():
-        logging.error("Interface '%s' not found. Available: %s", args.interface, ", ".join(get_if_list()))
+        logging.error("Interface '%s' not found. Available: %s",
+                      args.interface, ", ".join(get_if_list()))
         return 2
 
     conf.verb = 0
@@ -283,12 +386,23 @@ def main():
         logging.info("No hosts discovered. Exiting.")
         return 0
 
-    hosts_icmp(hosts, timeout=args.timeout, workers=args.workers)
+    if not args.no_icmp:
+        hosts_icmp(hosts, timeout=args.timeout, workers=args.workers, retry=args.retry)
+
+    if not args.no_resolve_hostnames:
+        logging.info("Resolving hostnames...")
+        hosts_resolve_hostnames(hosts, timeout=args.timeout, workers=args.workers)
 
     if not args.no_vendor:
+        logging.info("Looking up MAC vendors...")
         for h in hosts.values():
             # To anonymize the MAC address by removing the device-specific part
-            anonymized_mac = h.mac.lower().rsplit(":", 3)[0] + ":ff:ff:ff"
+            mac_parts = h.mac.split(":")
+            if len(mac_parts) >= 3:
+                anonymized_mac = ":".join(mac_parts[:3]) + ":ff:ff:ff"
+            else:
+                anonymized_mac = h.mac
+
             try:
                 h.vendor = lookup_mac_vendor(anonymized_mac)
             except Exception:
@@ -297,7 +411,7 @@ def main():
     sorted_list = sort_hosts(hosts)
 
     if args.output == "table":
-        print(format_table(sorted_list))
+        output_table(sorted_list, out_file=args.out_file)
     elif args.output == "json":
         output_json(sorted_list, out_file=args.out_file)
     elif args.output == "csv":
@@ -305,7 +419,8 @@ def main():
 
     elapsed = time.perf_counter() - start
     reachable = sum(1 for h in hosts.values() if h.reachable)
-    logging.info("Summary: %d/%d reachable. Elapsed: %.2fs", reachable, len(hosts), elapsed)
+    logging.info("Summary: %d/%d reachable. Elapsed: %.2fs",
+                 reachable, len(hosts), elapsed)
 
 
 if __name__ == "__main__":
