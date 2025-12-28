@@ -19,6 +19,12 @@ from scapy.all import (
     srp, Ether, ARP, sr1, srp1, IP, ICMP, conf, get_if_list
 )
 
+try:
+    from pyfiglet import Figlet
+    PYFIGLET_AVAILABLE = True
+except ImportError:
+    PYFIGLET_AVAILABLE = False
+
 IPAddress = Union[IPv4Address, IPv6Address]
 
 
@@ -31,6 +37,23 @@ class Host:
     reachable: bool = False
     ttl: Optional[int] = None
     os_guess: Optional[str] = None
+
+
+def show_banner(version: str = "1.0.0") -> None:
+    """
+    Display ASCII art banner using pyfiglet.
+    """
+    if PYFIGLET_AVAILABLE:
+        try:
+            f = Figlet(font='slant')
+            print(f.renderText('dmax'))
+            print(f"Network Discovery Tool v{version}")
+            print(f"{'-' * 40}\n")
+        except Exception:
+            print(f"\n=== dmax - Network Discovery Tool v{version} ===\n")
+    else:
+        print(f"\n=== dmax - Network Discovery Tool v{version} ===\n")
+
 
 
 def subnet_type(value: str) -> ipaddress._BaseNetwork:
@@ -346,6 +369,8 @@ def parse_args():
                              help="Write output to file instead of stdout")
     output_opts.add_argument("-v", "--verbose", action="count", default=0,
                              help="Increase verbosity (-v for INFO, -vv for DEBUG)")
+    output_opts.add_argument("--no-banner", action="store_true",
+                          help="Suppress ASCII art banner")
 
     args = p.parse_args()
 
@@ -375,6 +400,9 @@ def main():
         return 2
 
     conf.verb = 0
+
+    if not args.no_banner and not args.out_file:
+        show_banner()
 
     start = time.perf_counter()
 
