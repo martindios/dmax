@@ -1,0 +1,6 @@
+# Core dependencies
+scapy>=2.7.0
+requests>=2.32.5
+
+# Optional
+pyfiglet>=1.0.4
